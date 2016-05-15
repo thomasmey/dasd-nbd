@@ -1,5 +1,6 @@
 package de.m3y3r.dasdnbd;
 
+import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -8,15 +9,24 @@ import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
 import java.nio.charset.Charset;
+import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.BiFunction;
 import java.util.zip.DataFormatException;
+import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 
 /*
  * Count Key Data DASD reader/writer in null format 2 (linux)
  */
-public class CountKeyDataDasd {
+public class CountKeyDataDasd implements Closeable {
+
+	private static final long SECTORS_PER_TRACK = 12;
+	private static final long SECTOR_SIZE = 4096;
+	private static final int FREE_SPACE_BLOCK_LENGTH = 8;
+	private static final int L2_ENTRY_SIZE = 8;
 
 	private ByteOrder byteOrder = ByteOrder.LITTLE_ENDIAN;
 	private FileChannel channel;
@@ -25,6 +35,7 @@ public class CountKeyDataDasd {
 	private MappedByteBuffer level1Table;
 	private Charset ebcdicCharset;
 	private Map<String, Map<String, Number>> partitions;
+	private MappedByteBuffer freeSpaceMap;
 
 	public CountKeyDataDasd(String dasdFileName) throws IOException {
 		ebcdicCharset = Charset.forName("IBM-037");
@@ -35,7 +46,7 @@ public class CountKeyDataDasd {
 
 	private void openCkdImage(String fname) throws IOException {
 		File ckdFile = new File(fname);
-		channel = FileChannel.open(ckdFile.toPath());
+		channel = FileChannel.open(ckdFile.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE);
 
 		deviceHeader = readDeviceHeader();
 		compressedDeviceHeader = readCompressedDeviceHeader();
@@ -47,8 +58,8 @@ public class CountKeyDataDasd {
 		ByteBuffer[] vol1 = readRecord(nullTrack, 3);
 		vol1[1].order(ByteOrder.BIG_ENDIAN);
 		vol1[1].position(11);
-		int vtocCylinder = u16ToInt(vol1[1].getShort());
-		int vtocHead = u16ToInt(vol1[1].getShort());
+		int vtocCylinder = ByteUtil.u16ToInt(vol1[1].getShort());
+		int vtocHead = ByteUtil.u16ToInt(vol1[1].getShort());
 		int vtocRecordNo = vol1[1].get();
 
 		ByteBuffer vtocTrack = readTrack(vtocCylinder, vtocHead);
@@ -64,7 +75,7 @@ public class CountKeyDataDasd {
 	private void processDatasetControlBlock(ByteBuffer[] vtocRecord) {
 		byte fmtId = vtocRecord[1].get();
 		switch(fmtId) {
-		/* we are actually only interessted in DSCB1 entries */
+		/* we are actually only interested in DSCB1 entries */
 		case (byte) 0xf1: 
 			Map<String, Object> f1 = readFormat1(vtocRecord[1]);
 			byte[] dsExt1 = (byte[]) f1.get("dsExt1");
@@ -83,10 +94,10 @@ public class CountKeyDataDasd {
 		Map<String, Number> s = new HashMap<>();
 		s.put("type", bb.get());
 		s.put("sequenceNumber", bb.get());
-		s.put("beginCylinder", u16ToInt(bb.getShort()));
-		s.put("beginTrack", u16ToInt(bb.getShort()));
-		s.put("endCylinder", u16ToInt(bb.getShort()));
-		s.put("endTrack", u16ToInt(bb.getShort()));
+		s.put("beginCylinder", ByteUtil.u16ToInt(bb.getShort()));
+		s.put("beginTrack", ByteUtil.u16ToInt(bb.getShort()));
+		s.put("endCylinder", ByteUtil.u16ToInt(bb.getShort()));
+		s.put("endTrack", ByteUtil.u16ToInt(bb.getShort()));
 		return s;
 	}
 
@@ -98,7 +109,7 @@ public class CountKeyDataDasd {
 			bb.get(ba);
 			s.put("volumeSerialNumber", ba);
 		}
-		s.put("volumeSequenceNumber", u16ToInt(bb.getShort()));
+		s.put("volumeSequenceNumber", ByteUtil.u16ToInt(bb.getShort()));
 		{
 			byte[] ba = new byte[3];
 			bb.get(ba);
@@ -125,10 +136,10 @@ public class CountKeyDataDasd {
 		}
 		s.put("recordFormat", bb.get());
 		s.put("optionCodes", bb.get());
-		s.put("blockLength", u16ToInt(bb.getShort()));
-		s.put("logicalRecordLength", u16ToInt(bb.getShort()));
+		s.put("blockLength", ByteUtil.u16ToInt(bb.getShort()));
+		s.put("logicalRecordLength", ByteUtil.u16ToInt(bb.getShort()));
 		s.put("keyLength", bb.get());
-		s.put("relativeKeyPosition", u16ToInt(bb.getShort()));
+		s.put("relativeKeyPosition", ByteUtil.u16ToInt(bb.getShort()));
 		s.put("datasetIndicators", bb.get());
 		{
 			byte[] ba = new byte[4];
@@ -140,7 +151,7 @@ public class CountKeyDataDasd {
 			bb.get(ba);
 			s.put("lastUsedTIR", ba); //?? WAT IS THIS?
 		}
-		s.put("bytesUnusedLastTrack", u16ToInt(bb.getShort()));
+		s.put("bytesUnusedLastTrack", ByteUtil.u16ToInt(bb.getShort()));
 		bb.get(new byte[2]); // resv3
 		{
 			byte[] ba = new byte[10];
@@ -171,6 +182,49 @@ public class CountKeyDataDasd {
 	 * @param recordNo which record to read
 	 */
 	ByteBuffer[] readRecord(ByteBuffer trackData, int recordNo) {
+		return (ByteBuffer[]) processRecord(trackData, recordNo, (rh, t) -> {
+			int kl = rh.get("keyLength").intValue();
+			int dl = rh.get("dataLength").intValue();
+
+			int l = t.limit();
+
+			t.limit(t.position() + kl);
+			ByteBuffer key = ByteBuffer.allocate(kl);
+			key.put(t);
+			key.rewind();
+
+			t.limit(t.position() + dl);
+			ByteBuffer data = ByteBuffer.allocate(dl);
+			data.put(t);
+			data.rewind();
+
+			t.limit(l);
+
+			return new ByteBuffer[] {key, data};
+		});
+	}
+
+	private void updateRecord(ByteBuffer trackData, int recordNo, ByteBuffer[] keyData) {
+		/*FIXME: what happens when the key and data length are shorter then the
+		 * existing ones? I think this will totally fuck up the track data
+		 * The remaining data needs to be moved to the correct location
+		 */
+		
+		processRecord(trackData, recordNo, (rh, t) -> {
+			int kl = rh.get("keyLength").intValue();
+			int dl = rh.get("dataLength").intValue();
+
+			assert kl == keyData[0].remaining();
+			assert dl == keyData[1].remaining();
+			keyData[0].limit(kl);
+			keyData[1].limit(dl);
+			trackData.put(keyData[0]);
+			trackData.put(keyData[1]);
+			return null;
+		});
+	}
+
+	private Object processRecord(ByteBuffer trackData, int recordNo, BiFunction<Map<String, Number>, ByteBuffer,Object> processor) {
 		while(true) {
 			Map<String, Number> recordHeader = readRecordHeader(trackData);
 			if(recordHeader == null)
@@ -181,20 +235,7 @@ public class CountKeyDataDasd {
 			int rn = recordHeader.get("recordNo").intValue();
 
 			if(rn == recordNo) {
-				int l = trackData.limit();
-
-				trackData.limit(trackData.position() + kl);
-				ByteBuffer key = ByteBuffer.allocate(kl);
-				key.put(trackData);
-				key.flip();
-				trackData.limit(trackData.position() + dl);
-				ByteBuffer data = ByteBuffer.allocate(dl);
-				data.put(trackData);
-				data.flip();
-
-				trackData.limit(l);
-
-				return new ByteBuffer[] {key, data};
+				return processor.apply(recordHeader, trackData);
 			}
 			trackData.position(trackData.position() + kl + dl);
 		}
@@ -204,34 +245,26 @@ public class CountKeyDataDasd {
 
 		// check end of track marker
 		{
-			int cp = trackData.position();
+			trackData.mark();
 			if(trackData.asLongBuffer().get() == -1)
 				return null;
-			trackData.position(cp);
+			trackData.reset();
 		}
 
 		trackData.order(ByteOrder.BIG_ENDIAN);
 		Map<String, Number> s = new HashMap<>();
-		s.put("cylinder", u16ToInt(trackData.getShort()));
-		s.put("head", u16ToInt(trackData.getShort()));
+		s.put("cylinder", ByteUtil.u16ToInt(trackData.getShort()));
+		s.put("head", ByteUtil.u16ToInt(trackData.getShort()));
 		s.put("recordNo", trackData.get());
 		s.put("keyLength", trackData.get());
-		s.put("dataLength", u16ToInt(trackData.getShort()));
+		s.put("dataLength", ByteUtil.u16ToInt(trackData.getShort()));
 		return s;
 	}
 
 	private MappedByteBuffer mapLevel1Table(int level1TableSize) throws IOException {
-		MappedByteBuffer level1Table = channel.map(MapMode.READ_ONLY, channel.position(), level1TableSize * Integer.BYTES);
+		MappedByteBuffer level1Table = channel.map(MapMode.READ_WRITE, channel.position(), level1TableSize * Integer.BYTES);
 		level1Table.order(byteOrder);
 		return level1Table;
-	}
-
-	public static long u32ToLong(int v) {
-		return (long)v & 0xff_ff_ff_ffl;
-	}
-
-	public static int u16ToInt(short v) {
-		return v & 0xff_ff;
 	}
 
 	private Map<String, Object> readDeviceHeader() throws IOException {
@@ -265,13 +298,13 @@ public class CountKeyDataDasd {
 
 		s.put("sizeLevel1Table", bb.getInt());
 		s.put("sizeLevel2Table", bb.getInt());
-		s.put("fileSize", bb.getInt());
-		s.put("fileUsed", bb.getInt());
-		s.put("positionToFreeSpace", bb.getInt());
-		s.put("totalFreeSpace", bb.getInt());
+		s.put("fileSize", ByteUtil.u32ToLong(bb.getInt()));
+		s.put("fileUsed", ByteUtil.u32ToLong(bb.getInt()));
+		s.put("positionToFreeSpace", ByteUtil.u32ToLong(bb.getInt()));
+		s.put("totalFreeSpace", ByteUtil.u32ToLong(bb.getInt()));
+		s.put("largestFreeSpace", ByteUtil.u32ToLong(bb.getInt()));
 		s.put("numberFreeSpaces", bb.getInt());
-		s.put("largestFreeSpace", bb.getInt());
-		s.put("ImbeddedFreeSpace", bb.getInt());
+		s.put("imbeddedFreeSpace", ByteUtil.u32ToLong(bb.getInt())); //FIXME: what is this field?!
 		s.put("noCylindersOnDevice", bb.getInt());
 		s.put("nullTrackFormat", bb.get());
 		s.put("compressAlgorithm", bb.get());
@@ -300,18 +333,21 @@ public class CountKeyDataDasd {
 		return bb;
 	}
 
-
+	/**
+	 * reads a track without track header
+	 * @param track
+	 * @return
+	 * @throws IOException
+	 */
 	private ByteBuffer readTrack(long track) throws IOException {
 
-		long pos = readLevel1Entry(track);
-		if(pos == 0) {
+		long l2BasePos = readLevel1Entry(track);
+		if(l2BasePos == 0) {
 			/* empty L2 table, L2 table not yet used...! */
-			return nullTrack(track, compressedDeviceHeader.get("nullTrackFormat").intValue());
+			return createNullTrack(track, compressedDeviceHeader.get("nullTrackFormat").intValue());
 		}
 
-		channel.position(pos);
-
-		Map<String, Number> l2Entry = readLevel2Entry(track);
+		Map<String, Number> l2Entry = readLevel2Entry(l2BasePos, track);
 		long posTrack = l2Entry.get("position").longValue();
 
 		/* FIXME:
@@ -320,35 +356,38 @@ public class CountKeyDataDasd {
 		 */
 		if(posTrack == 0) {
 			/* length and size field are mis-used for "null track format information... */
-			return nullTrack(track, l2Entry.get("length").intValue());
+			return createNullTrack(track, l2Entry.get("length").intValue());
 		}
 		channel.position(posTrack);
 
 		Map<String, Number> trackHeader = readTrackHeader();
 
-		//FIXME: size or length?!
-		ByteBuffer trackData = read(l2Entry.get("size").intValue());
+		ByteBuffer trackData = read(l2Entry.get("length").intValue());
 
 		int optComp = trackHeader.get("options").intValue() & 0xf;
-
 		switch(optComp) {
 		case 0:
 			return trackData;
 
 		case 1:
 			Inflater i = new Inflater();
-			i.setInput(trackData.array());
-			byte[] u = new byte[(int) Math.pow(2, 16)];
+			i.setInput(trackData.array(), 0, trackData.limit());
+			ByteBuffer ud = ByteBuffer.allocate((int) Math.pow(2, 16));
+			byte[] buffer = new byte[1024];
 			try {
-				int len = i.inflate(u);
-				ByteBuffer o = ByteBuffer.wrap(u);
-				o.limit(len);
-				return o;
+				while(!i.finished()) {
+					int len = i.inflate(buffer);
+					assert len >= 0 : "invalid compressed data";
+					ud.put(buffer, 0, len);
+				}
+				ud.flip();
+				return ud;
 			} catch (DataFormatException e) {
 				e.printStackTrace();
 			}
+		default:
+			throw new IllegalArgumentException("Unknonw compression method " + optComp + " for trackNo "+ track); 
 		}
-		return null;
 	}
 
 	public ByteBuffer readTrack(long cylinder, int head) throws IOException {
@@ -356,7 +395,7 @@ public class CountKeyDataDasd {
 		return readTrack(trk);
 	}
 
-	private ByteBuffer nullTrack(long track, int nullTrackFormat) {
+	private ByteBuffer createNullTrack(long track, int nullTrackFormat) {
 		ByteBuffer trackData = ByteBuffer.allocate((int)deviceHeader.get("trackSize"));
 
 		//FIXME: what byte order?
@@ -372,14 +411,14 @@ public class CountKeyDataDasd {
 			writeRecord(trackData, (int) cylinder, head, (short) 1, null, null);
 			break;
 		case 2:
-			ByteBuffer blockSize = ByteBuffer.allocate(4096);
-			for(short r = 1; r <= 12; r++) {
+			ByteBuffer blockSize = ByteBuffer.allocate((int) SECTOR_SIZE);
+			for(short r = 1; r <= SECTORS_PER_TRACK; r++) {
 				blockSize.clear();
 				writeRecord(trackData, (int) cylinder, head, r, null, blockSize);
 			}
 		}
 		/* add end of track marker */
-		for(int i = 0, n= 8; i < n; i++)
+		for(int i = 0, n = 8; i < n; i++)
 			trackData.put((byte) 0xff);
 
 		trackData.flip();
@@ -413,25 +452,52 @@ public class CountKeyDataDasd {
 
 	private Map<String, Number> readTrackHeader() throws IOException {
 		ByteBuffer trackHeader = read(5, ByteOrder.BIG_ENDIAN);
-		Map<String, Number> s2 = new HashMap<>();
-		s2.put("options", trackHeader.get());
-		s2.put("cylinder", u16ToInt(trackHeader.getShort()));
-		s2.put("head", u16ToInt(trackHeader.getShort()));
-		return s2;
+		Map<String, Number> s = new HashMap<>();
+		s.put("options", trackHeader.get());
+		s.put("cylinder", ByteUtil.u16ToInt(trackHeader.getShort()));
+		s.put("head", ByteUtil.u16ToInt(trackHeader.getShort()));
+		return s;
 	}
 
-	private Map<String, Number> readLevel2Entry(long trk) throws IOException {
-		int l2entrySize = 8;
-		ByteBuffer level2Entries = read(compressedDeviceHeader.get("sizeLevel2Table").intValue() * l2entrySize);
+	private ByteBuffer createTrackHeader(long trackNo, byte compAlg) {
+
+		char[] ch = getCylinderHeader(trackNo);
+
+		ByteBuffer trackHeader = ByteBuffer.allocate(5).order(ByteOrder.BIG_ENDIAN);
+		trackHeader.put(compAlg);
+		trackHeader.putShort((short) ch[0]);
+		trackHeader.putShort((short) ch[1]);
+		trackHeader.rewind();
+		return trackHeader;
+	}
+
+	/*FIXME: File position needs to be set to the correct position before calling this method!!! */
+	private Map<String, Number> readLevel2Entry(long l2BasePos, long trk) throws IOException {
+		channel.position(l2BasePos);
+		ByteBuffer level2Entries = read(compressedDeviceHeader.get("sizeLevel2Table").intValue() * L2_ENTRY_SIZE);
 
 		int l2ent = (int) (trk % compressedDeviceHeader.get("sizeLevel2Table").intValue());
-		level2Entries.position(l2ent * l2entrySize);
+		level2Entries.position(l2ent * L2_ENTRY_SIZE);
 
 		Map<String, Number> s = new HashMap<>();
-		s.put("position", u32ToLong(level2Entries.getInt()));
-		s.put("length", u16ToInt(level2Entries.getShort()));
-		s.put("size", u16ToInt(level2Entries.getShort()));
+		long pos = ByteUtil.u32ToLong(level2Entries.getInt());
+		s.put("position", pos);
+		s.put("length", ByteUtil.u16ToInt(level2Entries.getShort()));
+		s.put("size", ByteUtil.u16ToInt(level2Entries.getShort()));
 		return s;
+	}
+
+	private void writeLevel2Entry(long level2EntryBasePos, long trackNo, Map<String, Number> level2Entry) throws IOException {
+
+		ByteBuffer l2Entry = ByteBuffer.allocate(L2_ENTRY_SIZE).order(byteOrder);
+		l2Entry.putInt(level2Entry.get("position").intValue());
+		l2Entry.putShort(level2Entry.get("length").shortValue());
+		l2Entry.putShort(level2Entry.get("size").shortValue());
+		l2Entry.rewind();
+
+		int l2ent = (int) (trackNo % compressedDeviceHeader.get("sizeLevel2Table").intValue());
+		this.channel.position(level2EntryBasePos + (l2ent * L2_ENTRY_SIZE));
+		this.channel.write(l2Entry);
 	}
 
 	/*FIXME: cylinder is long or int? */
@@ -439,9 +505,16 @@ public class CountKeyDataDasd {
 		return (cylinder * (int)deviceHeader.get("noHeads")) + head;
 	}
 
+	//cylinder, head are actually 16 bit unsigned, may use char type here!
+	private char[] getCylinderHeader(long trackNo) {
+
+		int nh = (int)deviceHeader.get("noHeads");
+		return new char[] { (char) (trackNo / nh), (char) (trackNo % nh)};
+	}
+
 	private long readLevel1Entry(long trk) {
 		int l1ent = (int) (trk / compressedDeviceHeader.get("sizeLevel2Table").intValue());
-		long pos = u32ToLong(level1Table.asIntBuffer().get(l1ent));
+		long pos = ByteUtil.u32ToLong(level1Table.asIntBuffer().get(l1ent));
 		return pos;
 	}
 
@@ -459,35 +532,32 @@ public class CountKeyDataDasd {
 
 		long totalTracks = endTrack - beginTrack + 1; //FIXME +1 correct?
 
-		long size = totalTracks * 12 * 4096;
+		long size = totalTracks * SECTORS_PER_TRACK * SECTOR_SIZE;
 		return size;
 	}
 
-	public ByteBuffer readTrackByOffset(String exportName, long offset, int length) throws IOException {
+	public ByteBuffer readDataByOffset(String exportName, long offset, int length) throws IOException {
 		Map<String, Number> s = partitions.get(exportName);
 		if(s == null) throw new IllegalArgumentException();
 
-//		System.out.println("read data with offset=" + offset + " length=" + length);
+		if(offset < 0 || offset >= getPartitionSize(exportName)) {
+			throw new IllegalArgumentException("Illegal offset " + offset + " should between 0 and " + getPartitionSize(exportName));
+		}
+
 		long beginCyl = s.get("beginCylinder").longValue(),
 			beginHead = s.get("beginTrack").intValue();
 
 		long beginTrack = getTrackNo(beginCyl, (short) beginHead);
 		ByteBuffer dataTotal = ByteBuffer.allocate(length);
 
-		int sectorSize = 4096;
-		int sectorsPerTrack = 12;
-
-		long trackRel = offset / (sectorSize * sectorsPerTrack);
-		long offsetRel = offset % (sectorSize * sectorsPerTrack);
+		long trackRel = offset / (SECTOR_SIZE * SECTORS_PER_TRACK);
+		long offsetRel = offset % (SECTOR_SIZE * SECTORS_PER_TRACK);
 		long trackTotal = beginTrack + trackRel;
 
 		ByteBuffer trackData = readTrack(trackTotal);
-		int sector = (int) (offsetRel / sectorSize);
-		int sectorRel = (int) (offsetRel % sectorSize);
+		int sector = (int) (offsetRel / SECTOR_SIZE);
+		int sectorRel = (int) (offsetRel % SECTOR_SIZE);
 
-		long[] ch = cylHeadFromTrack(trackTotal);
-//		System.out.println("cyl=" + ch[0] + " head=" + ch[1]);
-//		System.out.println("trk=" + trackTotal + " offset=" + offset + " relOffset=" + offsetRel + " sector=" + sector);
 		while(length > 0) {
 			ByteBuffer[] keyData = readRecord(trackData, ++sector);
 
@@ -502,8 +572,294 @@ public class CountKeyDataDasd {
 			dataTotal.put(keyData[1]);
 			length -= keyData[1].limit();
 			offset += keyData[1].limit();
-			if(sector >= sectorsPerTrack) { sector = 0; trackData = readTrack(++trackTotal);}
+			if(sector >= SECTORS_PER_TRACK) { sector = 0; trackData = readTrack(++trackTotal);}
 		};
 		return dataTotal;
+	}
+
+	public void writeDataByOffset(String exportName, long offset, ByteBuffer data) throws IOException {
+		Map<String, Number> s = partitions.get(exportName);
+		if(s == null) throw new IllegalArgumentException();
+
+		if(offset < 0 || offset >= getPartitionSize(exportName)) {
+			throw new IllegalArgumentException("Illegal offset " + offset + " should between 0 and " + getPartitionSize(exportName));
+		}
+
+		long beginCyl = s.get("beginCylinder").longValue(),
+			beginHead = s.get("beginTrack").intValue();
+
+		long beginTrack = getTrackNo(beginCyl, (short) beginHead);
+
+		long trackRel = offset / (SECTOR_SIZE * SECTORS_PER_TRACK);
+		long offsetRel = offset % (SECTOR_SIZE * SECTORS_PER_TRACK);
+		long trackTotal = beginTrack + trackRel;
+
+		ByteBuffer trackData = readTrack(trackTotal);
+		int sector = (int) (offsetRel / SECTOR_SIZE);
+		int sectorRel = (int) (offsetRel % SECTOR_SIZE);
+
+		while(data.hasRemaining()) {
+			trackData.mark();
+			ByteBuffer[] keyData = readRecord(trackData, ++sector);
+
+			if(sectorRel > 0) {
+				keyData[1].position(sectorRel);
+				sectorRel = 0;
+			}
+
+			while(keyData[1].hasRemaining() && data.hasRemaining()) {
+				keyData[1].put(data.get());
+			}
+			keyData[1].rewind();
+
+			trackData.reset();
+			updateRecord(trackData, sector, keyData);
+
+			if(sector >= SECTORS_PER_TRACK) {
+				writeTrack(trackTotal, trackData);
+				sector = 0;
+				trackData = readTrack(++trackTotal);
+			}
+		};
+		writeTrack(trackTotal, trackData);
+	}
+
+	private void writeTrack(long trackNo, ByteBuffer trackData) throws IOException {
+
+		assert trackData != null;
+
+		long level2EntryBasePos = readLevel1Entry(trackNo);
+		if(level2EntryBasePos == 0) { // unused level1 table entry
+			ByteBuffer level2Table = createLevel2Table();
+			level2EntryBasePos = allocateFreeSpace(level2Table.limit());
+			writeLevel2Table(level2EntryBasePos, level2Table);
+			writeLevel1Entry(trackNo, level2EntryBasePos);
+		} else if(level2EntryBasePos == -1) {
+			/* table is in another file */
+			throw new IllegalArgumentException();
+		}
+
+		Map<String, Number> level2Entry = readLevel2Entry(level2EntryBasePos, trackNo);
+		byte compAlg = compressedDeviceHeader.get("compressAlgorithm").byteValue();
+		switch(compAlg) {
+			case 1:
+			// compress trackData with libz
+			ByteBuffer comp = ByteBuffer.allocate((int) Math.pow(2, 16));
+
+			Deflater d = new Deflater();
+			byte[] buffer = new byte[1024];
+			d.setInput(trackData.array(), 0, trackData.limit());
+			d.finish();
+
+			while(!d.finished()) {
+				int len = d.deflate(buffer);
+				comp.put(buffer, 0 , len);
+			}
+			comp.flip();
+			trackData = comp;
+			break;
+
+			default:
+				throw new IllegalArgumentException();
+		}
+
+		trackData.rewind();
+
+		ByteBuffer trackHeader = createTrackHeader(trackNo, compAlg);
+
+		/* Track size  (size >= len) */
+		long oldTrackPos = level2Entry.get("position").longValue();
+		int oldTrackLen = level2Entry.get("length").intValue();
+		int oldTrackSize = level2Entry.get("size").intValue();
+
+		assert oldTrackSize >= oldTrackLen: "size >= len failed for track: " + trackNo;
+
+		int newTrackLen =  trackHeader.limit() + trackData.limit();
+		long newTrackPos = oldTrackPos;
+		long newTrackSize = oldTrackSize;
+
+		// check for empty level2 entry
+		if(oldTrackPos == 0) {
+			newTrackPos = allocateFreeSpace(newTrackLen);
+			newTrackSize = newTrackLen;
+		}
+
+		// check for in-place update
+		if(newTrackLen > newTrackSize) {
+			newTrackPos = allocateFreeSpace(newTrackLen);
+			newTrackSize = newTrackLen;
+			deallocateFreeSpace(oldTrackPos, oldTrackSize);
+		}
+
+		// write track header and data
+		this.channel.position(newTrackPos);
+		this.channel.write(trackHeader);
+		this.channel.write(trackData);
+
+		// update level2 entry
+		level2Entry.put("position", newTrackPos);
+		level2Entry.put("length", newTrackLen);
+		level2Entry.put("size", newTrackSize);
+		writeLevel2Entry(level2EntryBasePos, trackNo, level2Entry);
+	}
+
+	private void writeLevel1Entry(long trk, long level2EntryBasePos) {
+		int l1ent = (int) (trk / compressedDeviceHeader.get("sizeLevel2Table").intValue());
+		level1Table.asIntBuffer().put(l1ent, (int)level2EntryBasePos);
+	}
+
+	private void writeLevel2Table(long level2TableBasePos, ByteBuffer level2Table) throws IOException {
+		this.channel.position(level2TableBasePos);
+		this.channel.write(level2Table);
+	}
+
+	private void deallocateFreeSpace(long freeSpacePos, int freeSpaceSize) throws IOException {
+		// add a new free space entry in the free space map increase no of free spaces in header field
+
+		//FIXME: check max free space map length!!
+		int noFreeSpaces = compressedDeviceHeader.get("numberFreeSpaces").intValue();
+		noFreeSpaces++;
+
+		// first block contains FREE_BLK!
+		freeSpaceMap.position(FREE_SPACE_BLOCK_LENGTH + (noFreeSpaces * FREE_SPACE_BLOCK_LENGTH));
+		compressedDeviceHeader.put("numberFreeSpaces", noFreeSpaces);
+		freeSpaceMap.mark();
+		updateFreeSpaceBlock(freeSpaceMap, freeSpacePos, freeSpaceSize);
+
+		long totalFreeSpace = compressedDeviceHeader.get("totalFreeSpace").longValue();
+		compressedDeviceHeader.put("totalFreeSpace", totalFreeSpace + freeSpaceSize);
+	}
+
+	private long allocateFreeSpace(int len) throws IOException {
+
+		long freeSpacePos = -1;
+
+		long lfs = (long) compressedDeviceHeader.get("largestFreeSpace");
+		if(len > lfs) {
+			// too big to fit in a free space slot, append to end of file
+			//FIXME: not supported yet
+			throw new IllegalArgumentException();
+		} else {
+			// find free space slot
+			long positionToFreeSpace = (long) compressedDeviceHeader.get("positionToFreeSpace");
+
+			if(freeSpaceMap == null) {
+				/* test for old or new free block format */
+				this.channel.position(positionToFreeSpace);
+				ByteBuffer format = read(FREE_SPACE_BLOCK_LENGTH);
+				if(!Arrays.equals("FREE_BLK".getBytes(), format.array())) {
+					throw new IllegalAccessError("old free space block format not supported!");
+				}
+
+				// first entry seems to be the free space map itself, map complete area
+				long[] freeBlockPosLen = readFreeSpaceBlock(read(FREE_SPACE_BLOCK_LENGTH));
+;				freeSpaceMap = this.channel.map(MapMode.READ_WRITE, freeBlockPosLen[0], freeBlockPosLen[1]);
+				freeSpaceMap.order(byteOrder);
+			}
+
+			freeSpaceMap.position(FREE_SPACE_BLOCK_LENGTH); // skip first entry "FREE_BLK)
+			int noFreeSpaces = compressedDeviceHeader.get("numberFreeSpaces").intValue();
+			for(int i = 0; i < noFreeSpaces; i++) {
+
+				freeSpaceMap.mark();
+				long[] freeBlockPosLen = readFreeSpaceBlock(freeSpaceMap);
+
+				//FIXME: skip the first entry, as it seems to describe the free space map itself! 
+				if(i == 0) continue; // if(positionToFreeSpace == reeBlockPosLen[0])...
+
+				if(len < freeBlockPosLen[1]) {
+					/* data fits into current free block, assign position */
+					long remainingFreeSpaceInBlock = (long) (freeBlockPosLen[1] - len);
+					long newBlockPos = freeBlockPosLen[0] + len + 1;
+					updateFreeSpaceBlock(freeSpaceMap, newBlockPos, remainingFreeSpaceInBlock);
+
+					/* check for largest free space area */
+					if(lfs == freeBlockPosLen[1]) {
+						/* update device header field with new value */
+						compressedDeviceHeader.put("largestFreeSpace", remainingFreeSpaceInBlock);
+					}
+					freeSpacePos = freeBlockPosLen[0];
+					break;
+				}
+			}
+		}
+
+		// update header statistics
+		if(freeSpacePos > 0) {
+			long totalFreeSpace = compressedDeviceHeader.get("totalFreeSpace").longValue();
+			compressedDeviceHeader.put("totalFreeSpace", totalFreeSpace - len);
+		}
+
+		assert freeSpacePos >= 0;
+
+		return freeSpacePos;
+	}
+
+	private void updateFreeSpaceBlock(MappedByteBuffer freeSpaceMap, long freeSpacePosition, long freeSpaceLength) throws IOException {
+
+		freeSpaceMap.reset();
+		freeSpaceMap.putInt((int) freeSpacePosition);
+		freeSpaceMap.putInt((int) freeSpaceLength);
+	}
+
+	private long[] readFreeSpaceBlock(ByteBuffer freeSpaceBlock) throws IOException {
+		long currentFreeBlockPosition = ByteUtil.u32ToLong(freeSpaceBlock.getInt());
+		long currentFreeBlockLength = ByteUtil.u32ToLong(freeSpaceBlock.getInt());
+		return new long[] {currentFreeBlockPosition, currentFreeBlockLength};
+	}
+
+	/* create empty l2 table */
+	private ByteBuffer createLevel2Table() {
+		int n = compressedDeviceHeader.get("sizeLevel2Table").intValue();
+		short nullFormat = compressedDeviceHeader.get("nullTrackFormat").shortValue();
+
+		ByteBuffer level2Entries = ByteBuffer.allocate(n * L2_ENTRY_SIZE).order(byteOrder);
+
+		for(int i = 0; i < n; i++) {
+			level2Entries.putInt(0);
+			level2Entries.putShort(nullFormat);
+			level2Entries.putShort(nullFormat);
+		}
+		level2Entries.rewind();
+		return level2Entries;
+	}
+
+	@Override
+	public void close() throws IOException {
+		// write cache to data
+
+		// FIXME: sync headers to disk!!
+//		writeDeviceHeader(deviceHeader);
+		writeCompressedDiskHeader(compressedDeviceHeader);
+		channel.close();
+	}
+
+	private void writeCompressedDiskHeader(Map<String, Number> compressedDeviceHeader) throws IOException {
+
+		ByteBuffer cdh = ByteBuffer.allocate(512).order(byteOrder);
+		cdh.put(compressedDeviceHeader.get("v").byteValue());
+		cdh.put(compressedDeviceHeader.get("r").byteValue());
+		cdh.put(compressedDeviceHeader.get("m").byteValue());
+		cdh.put(compressedDeviceHeader.get("options").byteValue());
+		cdh.putInt(compressedDeviceHeader.get("sizeLevel1Table").intValue());
+		cdh.putInt(compressedDeviceHeader.get("sizeLevel2Table").intValue());
+		cdh.putInt(compressedDeviceHeader.get("fileSize").intValue());
+		cdh.putInt(compressedDeviceHeader.get("fileUsed").intValue());
+		cdh.putInt(compressedDeviceHeader.get("positionToFreeSpace").intValue());
+		cdh.putInt(compressedDeviceHeader.get("totalFreeSpace").intValue());
+		cdh.putInt(compressedDeviceHeader.get("largestFreeSpace").intValue());
+		cdh.putInt(compressedDeviceHeader.get("numberFreeSpaces").intValue());
+		cdh.putInt(compressedDeviceHeader.get("imbeddedFreeSpace").intValue());
+		cdh.putInt(compressedDeviceHeader.get("noCylindersOnDevice").intValue());
+		cdh.put(compressedDeviceHeader.get("nullTrackFormat").byteValue());
+		cdh.put(compressedDeviceHeader.get("compressAlgorithm").byteValue());
+		cdh.putShort(compressedDeviceHeader.get("compressParameter").shortValue());
+		cdh.rewind();
+		this.channel.position(512);
+		this.channel.write(cdh);
+	}
+
+	public void sync() throws IOException {
+		this.channel.force(true);
 	}
 }

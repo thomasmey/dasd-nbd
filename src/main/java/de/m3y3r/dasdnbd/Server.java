@@ -59,58 +59,65 @@ public class Server implements Runnable {
 	 * nbd server runs in IANA port 10809
 	 */
 	public void run() {
-		try {
-//			Channel ch = System.inheritedChannel();
-//			ServerSocketChannel ssc = (ServerSocketChannel) ch;
-			ServerSocketChannel ssc = ServerSocketChannel.open().bind(new InetSocketAddress(InetAddress.getByName(null), PORT));
 
-				SocketChannel sc = ssc.accept();
+//		Channel ch = System.inheritedChannel();
+//		ServerSocketChannel ssc = (ServerSocketChannel) ch;
+		try(ServerSocketChannel ssc = ServerSocketChannel.open()) {
+			ssc.bind(new InetSocketAddress(InetAddress.getByName(null), PORT));
+
+			try(SocketChannel sc = ssc.accept()) {
 				String exportName = doHandshake(sc);
 
 				System.out.println(exportName);
 
 				/* transmission mode */
-				int len;
+				out:
+					while(true) {
+						ByteBuffer bb = readData(sc, 28);
 
-				while(true) {
-					ByteBuffer bb = readData(sc, 28);
+						if(bb.getInt() != 0x25609513) {
+							// FIXME: what to do? reply anyway?
+							continue;
+						}
 
-					if(bb.getInt() != 0x25609513) {
-						// FIXME: what to do? reply anyway?
-						continue;
+						short commandFlags = bb.getShort();
+						short type = bb.getShort();
+						long handle = bb.getLong();
+						long offset = bb.getLong(); //FIXME: unsigned!
+						long length = ByteUtil.u32ToLong(bb.getInt());
+
+						switch(type) {
+						case NBD_CMD_READ:
+						{
+							ByteBuffer data = ckd.readDataByOffset(exportName, offset, (int) length);
+							sendSimpleReply(sc, 0, handle, data);
+							break;
+						}
+						case NBD_CMD_WRITE:
+						{
+							ByteBuffer data = readData(sc, (int) length);
+							ckd.writeDataByOffset(exportName, offset, data);
+							sendSimpleReply(sc, 0, handle, null);
+							break;
+						}
+						case NBD_CMD_DISC:
+						{
+							break out;
+						}
+						case NBD_CMD_FLUSH:
+							ckd.sync();
+							sendSimpleReply(sc, 0, handle, null);
+							break;
+//						case NBD_CMD_TRIM:
+						default:
+							sendSimpleReply(sc, NBD_REP_ERR_INVALID, handle, bb);
+						}
 					}
-
-					short commandFlags = bb.getShort();
-					short type = bb.getShort();
-					long handle = bb.getLong();
-					long offset = bb.getLong(); //FIXME: unsigned!
-					int length = bb.getInt(); //FIXME: unsigned!
-
-					switch(type) {
-					case NBD_CMD_READ:
-					{
-						ByteBuffer data = ckd.readTrackByOffset(exportName, offset, length);
-						sendSimpleReply(sc, 0, handle, data);
-						break;
-					}
-//					case NBD_CMD_WRITE:
-//					{
-//						ByteBuffer data = readData(sc, length);
-////						ckd.write();
-//						break;
-//					}
-					case NBD_CMD_DISC:
-					{
-						sc.close();
-						break;
-					}
-//					case NBD_CMD_FLUSH:
-//					case NBD_CMD_TRIM:
-
-					default:
-						sendSimpleReply(sc, NBD_REP_ERR_INVALID, handle, bb);
-				}
+			} finally {
+				if(ckd != null)
+					ckd.close();
 			}
+
 		} catch (IOException e) {
 			Logger.getLogger(Server.class.getName()).log(Level.SEVERE, "failed!", e);
 		}
@@ -178,7 +185,7 @@ public class Server implements Runnable {
 				/* build response */
 				bb.clear();
 				bb.putLong(exportSize);
-				short transmissionFlags = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_READ_ONLY;
+				short transmissionFlags = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH;
 				bb.putShort(transmissionFlags);
 				writeData(s, bb);
 
