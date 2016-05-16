@@ -385,9 +385,12 @@ public class CountKeyDataDasd implements Closeable {
 			} catch (DataFormatException e) {
 				e.printStackTrace();
 			}
+			break;
 		default:
 			throw new IllegalArgumentException("Unknonw compression method " + optComp + " for trackNo "+ track); 
 		}
+
+		return null;
 	}
 
 	public ByteBuffer readTrack(long cylinder, int head) throws IOException {
@@ -728,20 +731,37 @@ public class CountKeyDataDasd implements Closeable {
 
 		long totalFreeSpace = compressedDeviceHeader.get("totalFreeSpace").longValue();
 		compressedDeviceHeader.put("totalFreeSpace", totalFreeSpace + freeSpaceSize);
+		long fileUsed = compressedDeviceHeader.get("fileUsed").longValue();
+		compressedDeviceHeader.put("fileUsed", fileUsed - freeSpaceSize);
+
+		if(compressedDeviceHeader.get("largestFreeSpace").longValue() < freeSpaceSize) {
+			compressedDeviceHeader.put("largestFreeSpace", (long) freeSpaceSize);
+		}
 	}
 
 	private long allocateFreeSpace(int len) throws IOException {
 
 		long freeSpacePos = -1;
 
-		long lfs = (long) compressedDeviceHeader.get("largestFreeSpace");
+		long lfs = compressedDeviceHeader.get("largestFreeSpace").longValue();
 		if(len > lfs) {
 			// too big to fit in a free space slot, append to end of file
-			//FIXME: not supported yet
-			throw new IllegalArgumentException();
+
+			long fileSize = compressedDeviceHeader.get("fileSize").longValue();
+
+			//FIXME: where to get the maximum file size from?
+//			if(fileSize + len > deviceHeader.get("maxFileSize")) {
+//				throw new IllegalArgumentException("dataset too small!");
+//			}
+
+			compressedDeviceHeader.put("fileSize", fileSize + len);
+			long fileUsed = compressedDeviceHeader.get("fileUsed").longValue();
+			compressedDeviceHeader.put("fileUsed", fileUsed + len);
+			return fileSize;
 		} else {
 			// find free space slot
 			long positionToFreeSpace = (long) compressedDeviceHeader.get("positionToFreeSpace");
+			int noFreeSpaces = compressedDeviceHeader.get("numberFreeSpaces").intValue();
 
 			if(freeSpaceMap == null) {
 				/* test for old or new free block format */
@@ -751,21 +771,27 @@ public class CountKeyDataDasd implements Closeable {
 					throw new IllegalAccessError("old free space block format not supported!");
 				}
 
-				// first entry seems to be the free space map itself, map complete area
-				long[] freeBlockPosLen = readFreeSpaceBlock(read(FREE_SPACE_BLOCK_LENGTH));
-;				freeSpaceMap = this.channel.map(MapMode.READ_WRITE, freeBlockPosLen[0], freeBlockPosLen[1]);
-				freeSpaceMap.order(byteOrder);
+				// search free space block which describes the free space array itself!
+				for(;;) {
+					ByteBuffer fsb = read(FREE_SPACE_BLOCK_LENGTH);
+					long[] freeBlockPosLen = readFreeSpaceBlock(fsb);
+					if(positionToFreeSpace == freeBlockPosLen[0]) {
+						freeSpaceMap = this.channel.map(MapMode.READ_WRITE, freeBlockPosLen[0], freeBlockPosLen[1]);
+						freeSpaceMap.order(byteOrder);
+						break;
+					}
+				}
 			}
 
 			freeSpaceMap.position(FREE_SPACE_BLOCK_LENGTH); // skip first entry "FREE_BLK)
-			int noFreeSpaces = compressedDeviceHeader.get("numberFreeSpaces").intValue();
 			for(int i = 0; i < noFreeSpaces; i++) {
 
 				freeSpaceMap.mark();
 				long[] freeBlockPosLen = readFreeSpaceBlock(freeSpaceMap);
 
-				//FIXME: skip the first entry, as it seems to describe the free space map itself! 
-				if(i == 0) continue; // if(positionToFreeSpace == reeBlockPosLen[0])...
+				//skip the entry, that describes this free space block array itself! 
+				if(positionToFreeSpace == freeBlockPosLen[0])
+					continue;
 
 				if(len < freeBlockPosLen[1]) {
 					/* data fits into current free block, assign position */
@@ -788,6 +814,8 @@ public class CountKeyDataDasd implements Closeable {
 		if(freeSpacePos > 0) {
 			long totalFreeSpace = compressedDeviceHeader.get("totalFreeSpace").longValue();
 			compressedDeviceHeader.put("totalFreeSpace", totalFreeSpace - len);
+			long fileUsed = compressedDeviceHeader.get("fileUsed").longValue();
+			compressedDeviceHeader.put("fileUsed", fileUsed + len);
 		}
 
 		assert freeSpacePos >= 0;
