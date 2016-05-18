@@ -339,7 +339,7 @@ public class CountKeyDataDasd implements Closeable {
 	 * @return
 	 * @throws IOException
 	 */
-	private ByteBuffer readTrack(long track) throws IOException {
+	ByteBuffer readTrack(long track) throws IOException {
 
 		long l2BasePos = readLevel1Entry(track);
 		if(l2BasePos == 0) {
@@ -358,11 +358,13 @@ public class CountKeyDataDasd implements Closeable {
 			/* length and size field are mis-used for "null track format information... */
 			return createNullTrack(track, l2Entry.get("length").intValue());
 		}
+
 		channel.position(posTrack);
-
 		Map<String, Number> trackHeader = readTrackHeader();
+		int trackLen = l2Entry.get("length").intValue();
 
-		ByteBuffer trackData = read(l2Entry.get("length").intValue());
+		System.out.printf("Read track %d - fromPos %d - toPos %d - len %d\n", track, posTrack, posTrack + trackLen - 1, trackLen);
+		ByteBuffer trackData = read(trackLen - 5);
 
 		int optComp = trackHeader.get("options").intValue() & 0xf;
 		switch(optComp) {
@@ -695,6 +697,8 @@ public class CountKeyDataDasd implements Closeable {
 		}
 
 		// write track header and data
+		long trackLen = trackHeader.remaining() + trackData.remaining();
+		System.out.printf("Writing track %d - fromPos %d - toPos %d - len %d\n", trackNo, newTrackPos, newTrackPos + trackLen - 1, trackLen);
 		this.channel.position(newTrackPos);
 		this.channel.write(trackHeader);
 		this.channel.write(trackData);
@@ -721,11 +725,10 @@ public class CountKeyDataDasd implements Closeable {
 
 		//FIXME: check max free space map length!!
 		int noFreeSpaces = compressedDeviceHeader.get("numberFreeSpaces").intValue();
-		noFreeSpaces++;
 
 		// first block contains FREE_BLK!
 		freeSpaceMap.position(FREE_SPACE_BLOCK_LENGTH + (noFreeSpaces * FREE_SPACE_BLOCK_LENGTH));
-		compressedDeviceHeader.put("numberFreeSpaces", noFreeSpaces);
+		compressedDeviceHeader.put("numberFreeSpaces", noFreeSpaces + 1);
 		freeSpaceMap.mark();
 		updateFreeSpaceBlock(freeSpaceMap, freeSpacePos, freeSpaceSize);
 
@@ -746,18 +749,7 @@ public class CountKeyDataDasd implements Closeable {
 		long lfs = compressedDeviceHeader.get("largestFreeSpace").longValue();
 		if(len > lfs) {
 			// too big to fit in a free space slot, append to end of file
-
-			long fileSize = compressedDeviceHeader.get("fileSize").longValue();
-
-			//FIXME: where to get the maximum file size from?
-//			if(fileSize + len > deviceHeader.get("maxFileSize")) {
-//				throw new IllegalArgumentException("dataset too small!");
-//			}
-
-			compressedDeviceHeader.put("fileSize", fileSize + len);
-			long fileUsed = compressedDeviceHeader.get("fileUsed").longValue();
-			compressedDeviceHeader.put("fileUsed", fileUsed + len);
-			return fileSize;
+			return allocateEndOfFile(len);
 		} else {
 			// find free space slot
 			long positionToFreeSpace = (long) compressedDeviceHeader.get("positionToFreeSpace");
@@ -793,10 +785,10 @@ public class CountKeyDataDasd implements Closeable {
 				if(positionToFreeSpace == freeBlockPosLen[0])
 					continue;
 
-				if(len < freeBlockPosLen[1]) {
+				if(len <= freeBlockPosLen[1]) {
 					/* data fits into current free block, assign position */
 					long remainingFreeSpaceInBlock = (long) (freeBlockPosLen[1] - len);
-					long newBlockPos = freeBlockPosLen[0] + len + 1;
+					long newBlockPos = freeBlockPosLen[0] + len;
 					updateFreeSpaceBlock(freeSpaceMap, newBlockPos, remainingFreeSpaceInBlock);
 
 					/* check for largest free space area */
@@ -811,16 +803,37 @@ public class CountKeyDataDasd implements Closeable {
 		}
 
 		// update header statistics
-		if(freeSpacePos > 0) {
+		if(freeSpacePos >= 0) {
 			long totalFreeSpace = compressedDeviceHeader.get("totalFreeSpace").longValue();
-			compressedDeviceHeader.put("totalFreeSpace", totalFreeSpace - len);
 			long fileUsed = compressedDeviceHeader.get("fileUsed").longValue();
+			compressedDeviceHeader.put("totalFreeSpace", totalFreeSpace - len);
 			compressedDeviceHeader.put("fileUsed", fileUsed + len);
+		} else {
+			/* oh great! the free space block entry that contains the free space block map
+			 * "positionToFreeSpace", can also be the "largestFreeSpace".. WTF?!
+			 * allocate at the end of file in this case
+			 */
+			return allocateEndOfFile(len);
 		}
 
 		assert freeSpacePos >= 0;
 
 		return freeSpacePos;
+	}
+
+	private long allocateEndOfFile(int len) {
+
+		long fileSize = compressedDeviceHeader.get("fileSize").longValue();
+		long fileUsed = compressedDeviceHeader.get("fileUsed").longValue();
+
+		//FIXME: where to get the maximum file size from?
+//		if(fileSize + len > deviceHeader.get("maxFileSize")) {
+//			throw new IllegalArgumentException("dataset too small!");
+//		}
+
+		compressedDeviceHeader.put("fileSize", fileSize + len);
+		compressedDeviceHeader.put("fileUsed", fileUsed + len);
+		return fileSize;
 	}
 
 	private void updateFreeSpaceBlock(MappedByteBuffer freeSpaceMap, long freeSpacePosition, long freeSpaceLength) throws IOException {
